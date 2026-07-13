@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Healthcare project - VPC with private SNS connectivity via Interface Endpoint,
+  EC2 instance with IAM role to publish securely to SNS.
+
+Parameters:
+  SNSTopicArn:
+    Type: String
+    Description: ARN of the existing SNS topic (from Step 1)
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair name
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+Resources:
+
+  HospitalVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: hospital-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HospitalVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: hospital-public-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: hospital-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref HospitalVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HospitalVPC
+      Tags:
+        - Key: Name
+          Value: hospital-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 - allows SSH management access
+      VpcId: !Ref HospitalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: hospital-ec2-sg
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for SNS VPC Endpoint - allows HTTPS from EC2 SG only
+      VpcId: !Ref HospitalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: hospital-vpce-sg
+
+  SNSVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref HospitalVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  EC2SNSPublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: hospital-ec2-sns-publish-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SNSPublishOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref SNSTopicArn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2SNSPublishRole
+
+  HospitalEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: hospital-report-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y awscli
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref HospitalVPC
+  EC2PublicIP:
+    Description: Public IP of the EC2 instance
+    Value: !GetAtt HospitalEC2Instance.PublicIp
+  VPCEndpointId:
+    Description: SNS VPC Endpoint ID
+    Value: !Ref SNSVPCEndpoint
